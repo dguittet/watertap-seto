@@ -1,6 +1,6 @@
 import pyomo.environ as pyo
 
-from idaes.core import declare_process_block_class
+from idaes.core import declare_process_block_class, FlowsheetBlock
 from idaes.models.unit_models import Mixer
 
 from watertap.costing.watertap_costing_package import (
@@ -40,6 +40,8 @@ from watertap.costing.units.uv_aop import cost_uv_aop
 
 from watertap_contrib.reflo.solar_models.zero_order import Photovoltaic
 from watertap_contrib.reflo.costing.solar.photovoltaic import cost_pv
+from watertap_contrib.reflo.solar_models.surrogate.pv import PVSurrogate
+from watertap_contrib.reflo.costing.solar.pv_surrogate import cost_pv_surrogate
 from watertap_contrib.reflo.solar_models.surrogate.trough import TroughSurrogate
 from watertap_contrib.reflo.costing.solar.trough_surrogate import cost_trough_surrogate
 from watertap_contrib.reflo.unit_models.surrogate import LTMEDSurrogate
@@ -68,6 +70,7 @@ class REFLOCostingData(WaterTAPCostingData):
         MEDTVCSurrogate: cost_med_tvc_surrogate,
         VAGMDSurrogate: cost_vagmd_surrogate,
         Photovoltaic: cost_pv,
+        PVSurrogate: cost_pv_surrogate,
         TroughSurrogate: cost_trough_surrogate,
         Mixer: cost_mixer,
         Pump: cost_pump,
@@ -196,6 +199,20 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
 
         self.defined_flows = _DefinedFlowsDict()
 
+        self.electricity_cost_buy = pyo.Param(
+            mutable=True,
+            initialize=0.07,
+            doc="Electricity cost to buy",
+            units=pyo.units.USD_2018 / pyo.units.kWh,
+        )
+
+        self.electricity_cost_sell = pyo.Param(
+            mutable=True,
+            initialize=0.05,
+            doc="Electricity cost to sell",
+            units=pyo.units.USD_2018 / pyo.units.kWh,
+        )
+
         self.utilization_factor = pyo.Var(
             initialize=1,
             doc="Plant capacity utilization [fraction of uptime]",
@@ -224,15 +241,6 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
             doc="Weighted Average Cost of Capital [WACC]",
         )
 
-        self.electricity_cost = pyo.Param(
-            mutable=True,
-            initialize=0.0718,  # From EIA for 2021
-            doc="Electricity cost",
-            units=self.base_currency / pyo.units.kWh,
-        )
-
-        self.add_defined_flow("electricity", self.electricity_cost)
-
         self.electrical_carbon_intensity = pyo.Param(
             mutable=True,
             initialize=0.475,
@@ -252,6 +260,43 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
         )
         # fix the parameters
         self.fix_all_vars()
+
+        # electricity balance of the system for sales and purchases of electricity
+        treat_cost = self._get_treatment_cost_block()
+        en_cost = self._get_energy_cost_block()
+
+        self.aggregate_flow_electricity_purchased = pyo.Var(
+            initialize=0,
+            domain=pyo.NonNegativeReals,
+            doc="Aggregated electricity consumed",
+            units=pyo.units.kW,
+        )
+
+        self.aggregate_flow_electricity_sold = pyo.Var(
+            initialize=0,
+            domain=pyo.NonNegativeReals,
+            doc="Aggregated electricity produced",
+            units=pyo.units.kW,
+        )
+
+        # energy producer's electricity flow is negative
+        self.aggregate_electricity_balance = pyo.Constraint(
+            expr=self.aggregate_flow_electricity_purchased + -1 * en_cost.aggregate_flow_electricity == treat_cost.aggregate_flow_electricity + self.aggregate_flow_electricity_sold
+        )
+
+        self.aggregate_electricity_complement = pyo.Constraint(
+            expr=self.aggregate_flow_electricity_purchased * self.aggregate_flow_electricity_sold == 0
+        )
+
+        # if all("heat" in b.defined_flows for b in [treat_cost, en_cost]):
+        if all(hasattr(b, "aggregate_flow_heat") for b in [treat_cost, en_cost]):
+            self.aggregate_flow_heat = pyo.Var(
+                initialize=1e3,
+                # domain=pyo.NonNegativeReals,
+                doc="Aggregated heat flow",
+                units=pyo.units.kW,
+            )
+
         # Build the integrated system costs
         self.build_integrated_costs()
 
@@ -274,21 +319,12 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
             doc="Total operating cost for integrated system",
             units=self.base_currency / self.base_period,
         )
-        self.aggregate_flow_electricity = pyo.Var(
-            initialize=1e3,
-            # domain=pyo.NonNegativeReals,
-            doc="Aggregated electricity flow",
-            units=pyo.units.kW,
-        )
 
-        # if all("heat" in b.defined_flows for b in [treat_cost, en_cost]):
-        if all(hasattr(b, "aggregate_flow_heat") for b in [treat_cost, en_cost]):
-            self.aggregate_flow_heat = pyo.Var(
-                initialize=1e3,
-                # domain=pyo.NonNegativeReals,
-                doc="Aggregated heat flow",
-                units=pyo.units.kW,
-            )
+        # positive is for cost and negative for revenue
+        self.total_electric_operating_cost = pyo.Expression(
+            expr=(pyo.units.convert(self.aggregate_flow_electricity_purchased, to_units=pyo.units.kWh/pyo.units.year) * self.electricity_cost_buy 
+                  - pyo.units.convert(self.aggregate_flow_electricity_sold, to_units=pyo.units.kWh/pyo.units.year) * self.electricity_cost_sell) * self.utilization_factor
+        )
 
         self.total_capital_cost_constraint = pyo.Constraint(
             expr=self.total_capital_cost
@@ -306,10 +342,9 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
             )
         )
 
-        self.aggregate_flow_electricity_constraint = pyo.Constraint(
-            expr=self.aggregate_flow_electricity
-            == treat_cost.aggregate_flow_electricity
-            + en_cost.aggregate_flow_electricity
+        # positive is for consumption
+        self.aggregate_flow_electricity = pyo.Expression(
+            expr=self.aggregate_flow_electricity_purchased - self.aggregate_flow_electricity_sold
         )
 
         # if all("heat" in b.defined_flows for b in [treat_cost, en_cost]):
@@ -389,7 +424,25 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
             self.add_component("LCOE", LCOE_expr)
 
         if e_model == "surrogate":
-            raise NotImplementedError("We don't have surrogate models yet!")
+            fs = self._get_flowsheet()
+            en_cost = self._get_energy_cost_block()
+            self.annual_energy_generated = pyo.Param(
+                initialize=fs.energy.pv.annual_energy,
+                units=pyo.units.kWh / pyo.units.year,
+                doc=f"Annual energy generated by {e_model}",
+            )
+            LCOE_expr = pyo.Expression(
+                expr=(
+                    fs.energy.costing.total_capital_cost * self.factor_capital_annualization
+                    + (
+                        en_cost.aggregate_fixed_operating_cost
+                        + en_cost.aggregate_variable_operating_cost
+                    )
+                )
+                / pyo.units.convert(-1*en_cost.aggregate_flow_electricity, to_units=pyo.units.kWh/pyo.units.year)
+                * self.utilization_factor
+            )
+            self.add_component("LCOE", LCOE_expr)
 
     def add_specific_electric_energy_consumption(self, flow_rate):
         """
@@ -499,3 +552,16 @@ class REFLOSystemCostingData(FlowsheetCostingBlockData):
         else:
             pysam = getattr(self.model(), pysam_block_test_lst[0])
             return pysam
+
+    def _get_flowsheet(self):
+        block_test_lst = []
+        for k, v in vars(self.model()).items():
+            if isinstance(v, FlowsheetBlock):
+                block_test_lst.append(k)
+
+        if len(block_test_lst) != 1:
+            raise Exception("There is no instance of the flowsheet on this model.")
+
+        else:
+            fs = getattr(self.model(), block_test_lst[0])
+            return fs
